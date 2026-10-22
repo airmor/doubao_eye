@@ -48,7 +48,10 @@ DOUBAO_CHAT_URL = "https://www.doubao.com/chat/"
 # - screen 尺寸：headless 报告为窗口大小，真实为显示器分辨率
 # - window.outerWidth/outerHeight：headless 与 inner 相同，真实含浏览器框
 # - navigator.connection：headless 默认 3g/rtt150，真实桌面为 4g/低 rtt
-_STEALTH_JS = """
+# 屏幕分辨率与浏览器框高度由 Python 侧按运行机器探测后格式化进本模板
+# （{{SCREEN_W}}/{{SCREEN_H}}/{{AVAIL_H}}/{{CHROME_H}}），不硬编码任何
+# 具体机器的值。
+_STEALTH_TEMPLATE = """
 try {
   Object.defineProperty(navigator, 'webdriver', {get: () => false});
 } catch (e) {}
@@ -57,13 +60,23 @@ try {
 } catch (e) {}
 try {
   Object.defineProperty(window, 'outerWidth', {get: () => window.innerWidth});
-  Object.defineProperty(window, 'outerHeight', {get: () => window.innerHeight + 87});
+  Object.defineProperty(window, 'outerHeight', {get: () => window.innerHeight + {{CHROME_H}}});
 } catch (e) {}
 try {
-  Object.defineProperty(screen, 'width', {get: () => 1920});
-  Object.defineProperty(screen, 'height', {get: () => 1080});
-  Object.defineProperty(screen, 'availWidth', {get: () => 1920});
-  Object.defineProperty(screen, 'availHeight', {get: () => 1040});
+  // headless 的 screen 来自虚拟显示器（默认 800x600），实例属性与 CDP
+  // setDeviceMetricsOverride 都改不动 —— 覆盖原型 getter 才是彻底做法
+  const sp = Object.getPrototypeOf(screen);
+  const over = (obj, prop, val) => {
+    try {
+      Object.defineProperty(obj, prop, {get: () => val, configurable: true});
+    } catch (e) {}
+  };
+  over(sp, 'width', {{SCREEN_W}});
+  over(sp, 'height', {{SCREEN_H}});
+  over(sp, 'availWidth', {{SCREEN_W}});
+  over(sp, 'availHeight', {{AVAIL_H}});
+  over(sp, 'colorDepth', 24);
+  over(sp, 'pixelDepth', 24);
 } catch (e) {}
 try {
   if (navigator.connection) {
@@ -190,6 +203,68 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
+
+
+def _screen_geometry() -> tuple[int, int, int, int]:
+    """探测运行机器的真实屏幕几何 (width, height, availHeight, chrome_h)。
+
+    - Windows：用 ctypes 查物理显示器分辨率；任务栏高度从工作区推算
+    - macOS/Linux：读主显示器分辨率（ctypes/环境不可用时退回保守默认）
+    - chrome_h：浏览器窗口装饰高度（标签栏+地址栏+边框），Edge/Chrome
+      常见 ~87px —— 各浏览器差异不大，取该默认值
+
+    所有值都是"这台机器的合理值"，不硬编码特定机型。
+    """
+    w, h, avail_h = 1920, 1080, 1040   # 保守默认（最常见桌面分辨率）
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            user32.SetProcessDPIAware()
+            w = user32.GetSystemMetrics(0)
+            h = user32.GetSystemMetrics(1)
+            avail_h = user32.GetSystemMetrics(61)  # SM_CYWORKAREA
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            import re
+            m = re.search(r"Resolution:\s*(\d+)\s*x\s*(\d+)", out)
+            if m:
+                w, h = int(m.group(1)), int(m.group(2))
+                avail_h = h - 25   # macOS 菜单栏约 25px
+        except Exception:
+            pass
+    else:
+        # Linux：xdpyinfo 或环境变量兜底
+        try:
+            out = subprocess.run(
+                ["xdpyinfo"], capture_output=True, text=True, timeout=10,
+            ).stdout
+            import re
+            m = re.search(r"dimensions:\s*(\d+)x(\d+)", out)
+            if m:
+                w, h = int(m.group(1)), int(m.group(2))
+                avail_h = h - 40   # 常见任务栏高度
+        except Exception:
+            pass
+    if w <= 0 or h <= 0 or avail_h <= 0 or avail_h > h:
+        w, h, avail_h = 1920, 1080, 1040
+    return w, h, avail_h, 87
+
+
+def _build_stealth_js() -> str:
+    """按运行机器的真实屏幕几何填充 stealth 模板。"""
+    w, h, avail_h, chrome_h = _screen_geometry()
+    return (_STEALTH_TEMPLATE
+            .replace("{{SCREEN_W}}", str(w))
+            .replace("{{SCREEN_H}}", str(h))
+            .replace("{{AVAIL_H}}", str(avail_h))
+            .replace("{{CHROME_H}}", str(chrome_h)))
 
 
 def _needs_no_sandbox() -> bool:
@@ -692,9 +767,12 @@ class CdpBrowser:
                     log.info("UA + client hints 已覆盖: %s", clean_ua[:80])
                 except Exception as exc:
                     log.warning("UA 覆盖失败（继续运行）: %s", exc)
-            # 指纹加固脚本：在每个新文档执行（在站点脚本之前）
+            # 指纹加固脚本：在每个新文档执行（在站点脚本之前）；
+            # 屏幕几何按本机真实值填充（覆盖 Screen 原型 getter ——
+            # headless 虚拟显示器默认 800x600，实例属性与 CDP
+            # setDeviceMetricsOverride 都改不动原型 getter）
             await conn.call("Page.addScriptToEvaluateOnNewDocument",
-                            {"source": _STEALTH_JS})
+                            {"source": _build_stealth_js()})
 
             # 导航到豆包并等待页面就绪
             load_task = asyncio.create_task(
