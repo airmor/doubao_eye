@@ -20,7 +20,14 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from mcp.server.mcpserver import MCPServer
+
+try:
+    # mcp SDK 2.x：FastMCP 已改名 MCPServer
+    from mcp.server.mcpserver import MCPServer
+except ImportError:
+    # mcp SDK 1.x：等价的 FastMCP（name/instructions/lifespan 构造、
+    # @server.tool()、server.run("stdio") 全部兼容）
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
 from . import __version__
 from .browser import CdpBrowser, find_browser

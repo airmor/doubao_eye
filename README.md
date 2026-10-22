@@ -51,6 +51,10 @@ pip install -e .          # 或 uv pip install -e .
 要求：Python 3.10+，系统装有 Microsoft Edge 或 Chrome（Win11/macOS/Linux 常见路径
 自动探测；也可用环境变量 `DOUBAO_EYE_BROWSER` 指定路径）。
 
+mcp SDK **1.x 与 2.x 均支持**：2.x 用 `MCPServer`，1.x 自动回退到等价的
+`FastMCP`（现有全局装 mcp 1.x 的环境无需升级，不影响其他依赖 1.x 的工具链）。
+兼容性测试：`python tests/test_mcp_compat.py`。
+
 ## 接入 MCP 客户端
 
 ### Claude Code
