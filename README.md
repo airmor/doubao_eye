@@ -26,13 +26,17 @@ doubao_eye 是一个 MCP (Model Context Protocol) 服务：把豆包网页版的
 
 | 工具 | 用途 | 输入 |
 |---|---|---|
-| `look` | 看图并回答 | 本地路径 / http(s) URL / tos URI + 问题 |
-| `read` | 读文件并回答（PDF/Word/Excel/PPT/代码等 60+ 格式） | 本地路径 / URL / tos URI + 问题 |
+| `look` | 看图并回答 | 单图 `image` 或多图 `images` 列表（一次最多 9 张）+ 问题 |
+| `read` | 读文件并回答（PDF/Word/Excel/PPT/代码等 60+ 格式） | 单文件 `file` 或多文件 `files` 列表（最多 9 个）+ 问题 |
 | `watch` | 看视频（实验性，见下） | 同上 |
 | `status` | 查看服务状态（不启动浏览器） | — |
 
+**批量是推荐用法**：`look(images=[...])` / `read(files=[...])` 把多个附件合并进
+**一次**豆包对话 —— 匿名通道对连续对话有约 1 分钟的间隔限制（上传不受限），
+批量 N 个附件只需等一次间隔，逐个调用则要等 N 次。
+
 > `watch` 说明：豆包网页版聊天的上传接口目前仅接受文档与图片格式，不支持视频附件，
-> 因此 `watch` 对视频文件会返回明确的替代建议（抽帧后用 `look`）。
+> 因此 `watch` 对视频文件会返回明确的替代建议（抽帧后用 `look` 的 `images` 批量看）。
 
 ## 安装
 
@@ -96,7 +100,8 @@ agent 会自动调用对应工具并把豆包的回答整合进上下文。
 | `DOUBAO_EYE_HEADLESS` | `true` | 浏览器是否无头运行 |
 | `DOUBAO_EYE_IDLE_TIMEOUT` | `600` | 浏览器空闲自动关闭秒数（0=不关闭） |
 | `DOUBAO_EYE_TIMEOUT` | `150` | 等待豆包回答的最长秒数 |
-| `DOUBAO_EYE_BACKOFF` | `75` | 触发瞬时限流后的退避秒数（重试间隔） |
+| `DOUBAO_EYE_MIN_INTERVAL` | `15` | 两次对话的最小间隔秒数（主动限速） |
+| `DOUBAO_EYE_BACKOFF` | `45` | 撞上限流后的退避重试秒数 |
 | `DOUBAO_EYE_LOG` | `INFO` | 日志级别（日志走 stderr，不干扰 MCP stdio 协议） |
 
 ## 工作原理
@@ -114,7 +119,11 @@ MCP 客户端 ──stdio──▶ doubao_eye (Python)
 
 1. **浏览器层**（`browser.py`）：以 `--remote-debugging-port` 启动系统 Edge 的独立
    headless 实例，通过 WebSocket 说 CDP 协议（Page/Runtime 域），不依赖任何浏览器
-   自动化框架；注入轻量 stealth 脚本并覆盖 headless UA
+   自动化框架。与真实浏览器逐项对照消除 headless 指纹差异（曾因此被 710022004
+   持续拉黑）：UA 覆盖同时带 client hints 元数据（否则 Sec-CH-UA 头整组丢失）、
+   不禁用 GPU（软件渲染的 WebGL 报告 "Microsoft Basic Render Driver" 是自动化
+   强信号）、保留原生 plugins/Notification、AudioContext 挂起对齐真实手势策略、
+   platformVersion 按真实系统 build 计算；stealth 脚本只做最小必要修补
 2. **协议层**（`doubao.py`）：在页面上下文执行 JS ——
    上传四步（`prepare_upload` 拿匿名 STS → 浏览器内 `crypto.subtle` 做 AWS V4 签名 →
    TOS 直传 → `CommitImageUpload`），文件走 `prepare_upload` 返回的文件服务、图片走
@@ -122,15 +131,16 @@ MCP 客户端 ──stdio──▶ doubao_eye (Python)
    `/chat/completion` SSE 流（新事件格式 `STREAM_MSG_NOTIFY` 累积文本），附件与文本
    按 UI 真实结构分两条 message
 3. **服务层**（`server.py`）：MCP 工具注册、本地/URL/data-URI/tos-URI 输入解析、
-   图片尺寸探测、空闲监控与风控自愈
+   多附件批量合并、图片尺寸探测、空闲监控、主动限速与风控自愈
 
 ## 已知限制
 
-- 免登录通道由豆包风控管控：**带附件的调用建议间隔 1-2 分钟**（更密的调用会触发
-  710022002 瞬时限流，服务会自动退避 75 秒重试）；极端情况下设备指纹被拉黑
-  （710022004，自动重置 profile 换新身份重试）
+- 免登录通道由豆包风控管控：实测指纹干净时 **12 秒间隔连发 5 次全部成功**（10 秒
+  以上即正常人类节奏）；服务默认主动限速 15 秒，漏网撞上 710022002 时自动退避
+  重试，设备指纹被拉黑（710022004）时自动重置 profile。**把多个附件合并进一次
+  调用**仍是最有效的省间隔手段
 - 视频不支持附件输入（豆包网页版限制，非本服务问题）
-- 单文件 ≤ 50MB、图片 ≤ 20MB
+- 单文件 ≤ 50MB、图片 ≤ 20MB、单次调用最多 9 个附件
 - 速率与能力随豆包策略变化，无 SLA —— 适合个人开发者的轻量场景，不建议生产关键路径
 
 ## 常见问题

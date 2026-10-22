@@ -39,19 +39,51 @@ log = logging.getLogger(__name__)
 
 DOUBAO_CHAT_URL = "https://www.doubao.com/chat/"
 
-# 注入到每个新文档的轻量指纹加固脚本（在页面脚本之前执行）
+# 注入到每个新文档的指纹加固脚本（在页面脚本之前执行）。
+# 原则：headless=new 模式原生已具备大部分真实特征（plugins、UA-CH、
+# Notification 等），只修补真实残留的差异点，绝不引入真实浏览器没有的
+# 东西 —— 多余的补丁本身就是泄漏（曾因伪造 plugins 破坏迭代器协议）。
+# 实测（与正常浏览器逐项 diff）需要修补的仅有：
+# - navigator.webdriver：headless 下为 true/undefined，真实为 false
+# - screen 尺寸：headless 报告为窗口大小，真实为显示器分辨率
+# - window.outerWidth/outerHeight：headless 与 inner 相同，真实含浏览器框
+# - navigator.connection：headless 默认 3g/rtt150，真实桌面为 4g/低 rtt
 _STEALTH_JS = """
 try {
-  Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+  Object.defineProperty(navigator, 'webdriver', {get: () => false});
 } catch (e) {}
 try {
   Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh']});
 } catch (e) {}
 try {
-  Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+  Object.defineProperty(window, 'outerWidth', {get: () => window.innerWidth});
+  Object.defineProperty(window, 'outerHeight', {get: () => window.innerHeight + 87});
 } catch (e) {}
 try {
-  window.chrome = window.chrome || {runtime: {}};
+  Object.defineProperty(screen, 'width', {get: () => 1920});
+  Object.defineProperty(screen, 'height', {get: () => 1080});
+  Object.defineProperty(screen, 'availWidth', {get: () => 1920});
+  Object.defineProperty(screen, 'availHeight', {get: () => 1040});
+} catch (e) {}
+try {
+  if (navigator.connection) {
+    Object.defineProperty(navigator.connection, 'effectiveType', {get: () => '4g', configurable: true});
+    Object.defineProperty(navigator.connection, 'rtt', {get: () => 50, configurable: true});
+    Object.defineProperty(navigator.connection, 'downlink', {get: () => 10, configurable: true});
+    Object.defineProperty(navigator.connection, 'saveData', {get: () => false, configurable: true});
+  }
+} catch (e) {}
+// AudioContext：真实浏览器无用户手势时 state 为 suspended，headless 默认
+// running（autoplay 旗标对 AudioContext 不生效），需在构造时立即挂起
+try {
+  const OrigAC = window.AudioContext;
+  const PatchedAC = function (...args) {
+    const ctx = new OrigAC(...args);
+    try { if (ctx.state === 'running') ctx.suspend().catch(() => {}); } catch (e) {}
+    return ctx;
+  };
+  PatchedAC.prototype = OrigAC.prototype;
+  Object.defineProperty(window, 'AudioContext', {value: PatchedAC, configurable: true});
 } catch (e) {}
 """
 
@@ -158,6 +190,114 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
+
+
+# Chromium GREASE 品牌轮换表（与真实浏览器一致的占位品牌）
+_GREASE_BRANDS = ["Not_A Brand", "Not A(Brand", "Not?A_Brand",
+                  "Not/A)Brand", "Not-A.Brand"]
+
+
+def _windows_platform_version() -> str:
+    """按真实 Windows build 号计算 UA-CH platformVersion。
+
+    硬编码假值（如 15.0.0）会与真实系统（build 26100 → 19.0.0）不一致，
+    成为跨信号矛盾点。
+    """
+    try:
+        build = sys.getwindowsversion().build  # type: ignore[attr-defined]
+        if build >= 26100:
+            return "19.0.0"
+        if build >= 22631:
+            return "15.0.0"
+        if build >= 22621:
+            return "14.0.0"
+        if build >= 22000:
+            return "13.0.0"
+        return "10.0.0"   # Win10 报告为 10.0.0 封顶
+    except Exception:
+        return "15.0.0"
+
+
+def _browser_full_version(exe: str) -> Optional[str]:
+    """读取浏览器真实完整版本号（如 155.0.2997.18）。
+
+    UA 里只有 major（如 155.0.0.0），而 highEntropy fullVersionList 里
+    真实浏览器报完整 build 号 —— 造 .0.0.0 假值是可识别的矛盾。
+    Windows Edge 不响应 ``--version``，从 PE 文件版本信息读取。
+    """
+    import re
+
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-Item '{exe}').VersionInfo.FileVersion"],
+                capture_output=True, text=True, timeout=20,
+            ).stdout.strip()
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return None
+    try:
+        out = subprocess.run(
+            [exe, "--version"], capture_output=True, text=True, timeout=20,
+        ).stdout
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", out)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _client_hints_metadata(ua: str,
+                           full_version: Optional[str] = None) -> dict:
+    """从 UA 解析出 CDP ``Emulation.setUserAgentOverride`` 的
+    ``userAgentMetadata``，使浏览器恢复发送真实的 Sec-CH-UA 客户端提示头。
+
+    只覆盖 UA 而不给 metadata 时，Chromium 会丢弃全部 client hints 头 ——
+    真实浏览器每个请求都带它们，缺失是显眼的自动化标记。
+    """
+    import re
+
+    m_full = re.search(r"(?:Chrome|HeadlessChrome)/([\d.]+)", ua)
+    major = (m_full.group(1) if m_full else "155.0.0.0").split(".")[0]
+    full = full_version or (m_full.group(1) if m_full else "155.0.0.0")
+
+    if "Windows NT" in ua:
+        platform, platform_version = "Windows", _windows_platform_version()
+    elif "Mac OS X" in ua:
+        platform, platform_version = "macOS", "14.7.0"
+    else:
+        platform, platform_version = "Linux", "6.8.0"
+
+    vendor = "Microsoft Edge" if "Edg/" in ua else "Google Chrome"
+    # GREASE 品牌按主版本号轮换（与 Chromium 行为一致）
+    grease = _GREASE_BRANDS[int(major) % len(_GREASE_BRANDS)] if major.isdigit() \
+        else _GREASE_BRANDS[0]
+
+    brands = [
+        {"brand": "Chromium", "version": major},
+        {"brand": grease, "version": "8"},
+        {"brand": vendor, "version": major},
+    ]
+    full_brands = [
+        {"brand": "Chromium", "version": full},
+        {"brand": grease, "version": "8"},
+        {"brand": vendor, "version": full},
+    ]
+    return {
+        "brands": brands,
+        "fullVersionList": full_brands,
+        "fullVersion": full,
+        "platform": platform,
+        "platformVersion": platform_version,
+        "architecture": "x86",
+        "model": "",
+        "mobile": False,
+        "bitness": "64",
+        "wow64": False,
+    }
 
 
 class _CdpConnection:
@@ -475,10 +615,12 @@ class CdpBrowser:
             "--no-default-browser-check",
             "--disable-blink-features=AutomationControlled",
             "--remote-allow-origins=*",
-            "--disable-gpu",
-            "--mute-audio",
+            # 不加 --disable-gpu：软件渲染会让 WebGL 报告
+            # "Microsoft Basic Render Driver"，是自动化环境的强信号
+            # 不加 --lang：该旗标会把 monospace 泛型字体解析成 CJK 字体，
+            # 真实浏览器不走这条路径（语言由 CDP acceptLanguage 覆盖即可）
+            "--autoplay-policy=user-gesture-required",
             "--window-size=1280,720",
-            "--lang=zh-CN",
             "about:blank",
         ]
         if self.headless:
@@ -500,15 +642,21 @@ class CdpBrowser:
             conn = _CdpConnection(ws)
             await conn.call("Page.enable")
             await conn.call("Runtime.enable")
-            # headless 模式 UA 带 "HeadlessChrome" 标记，会被风控识别，
-            # 覆盖成正常浏览器 UA（Edg 后缀与真实 Edge 一致）
-            if self.headless and ua:
-                clean_ua = ua.replace("HeadlessChrome", "Chrome")
+            # headless 的 UA 带 "HeadlessChrome" 标记；且 CDP 覆盖 UA 时若
+            # 不给 userAgentMetadata，浏览器会丢弃全部 Sec-CH-UA 客户端提示
+            # 头 —— 真实浏览器每个请求都带这些头，缺失即自动化标记。
+            # 因此必须同时覆盖 UA 与 client hints 元数据。
+            if ua:
+                clean_ua = (ua.replace("HeadlessChrome", "Chrome")
+                               .replace("HeadlessEdg", "Edg"))
                 try:
-                    await conn.call("Emulation.setUserAgentOverride",
-                                    {"userAgent": clean_ua,
-                                     "acceptLanguage": "zh-CN,zh;q=0.9"})
-                    log.info("UA 已覆盖: %s", clean_ua[:80])
+                    await conn.call("Emulation.setUserAgentOverride", {
+                        "userAgent": clean_ua,
+                        "acceptLanguage": "zh-CN,zh",
+                        "userAgentMetadata": _client_hints_metadata(
+                            clean_ua, _browser_full_version(exe)),
+                    })
+                    log.info("UA + client hints 已覆盖: %s", clean_ua[:80])
                 except Exception as exc:
                     log.warning("UA 覆盖失败（继续运行）: %s", exc)
             # 指纹加固脚本：在每个新文档执行（在站点脚本之前）

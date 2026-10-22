@@ -259,12 +259,13 @@ _JS_CHAT = """
         message_status: 0,
       });
     }
-    for (const img of (arg.images || [])) {
+    if (arg.images && arg.images.length) {
+      // 多图合并进同一条附件 message（attachments 为数组，与 UI 结构一致）
       msgs.push({
         local_message_id: crypto.randomUUID(),
         content_block: [{
           block_type: 10052,
-          content: {attachment_block: {attachments: [{
+          content: {attachment_block: {attachments: arg.images.map(img => ({
             type: 1, identifier: crypto.randomUUID(),
             image: {
               name: img.name, uri: img.uri,
@@ -272,7 +273,7 @@ _JS_CHAT = """
                           format: img.format || 'png', url_formats: {}},
             },
             parse_state: 0, review_state: 1, upload_status: 1, progress: 100, src: '',
-          }]}, pc_event_block: ''},
+          }))}, pc_event_block: ''},
           block_id: crypto.randomUUID(), parent_id: '', meta_info: [],
           extra_info: {}, append_fields: [], is_finish: true, patch_type: 2,
         }],
