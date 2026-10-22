@@ -217,10 +217,11 @@ server = MCPServer(
         "doubao_eye 为不具备多模态能力的模型提供视觉："
         "看图用 look，读文档/代码/数据文件用 read，看视频用 watch（实验性）。"
         "每次调用 = 附件 + 一个问题，返回豆包的文字回答。"
-        "重要：两次调用之间有约 1 分钟的服务端间隔限制 —— "
+        "重要：两次调用之间有短时间的服务端间隔 —— "
         "请尽量把要看的多个文件/图片合并进一次调用（look 传 images 列表、"
         "read 传 files 列表），一次提问全部解决，而不是逐个调用。"
-        "问题请具体、可直接回答。"
+        "回答末尾的 attachment_uri 可在后续追问时直接作为附件参数传入，"
+        "无需重新上传。问题请具体、可直接回答。"
     ),
     lifespan=_lifespan,
 )
@@ -287,14 +288,23 @@ async def _run(question: str, items: list[tuple[str, str]],
                                      "image.png" if kind == "image" else "file.txt")
             (images if kind == "image" else files).append(ref)
         try:
-            return await _chat_with_retry(question, images, files)
+            answer = await _chat_with_retry(question, images, files)
         except _RateLimited as exc:
             return _err(str(exc))
+        # 附上 tos URI：agent 后续追问同一附件时可直接引用，免重传
+        uris = [r["uri"] for r in images + files]
+        if uris:
+            uri_lines = "\n".join(
+                f"attachment_uri[{i}]: {u}" for i, u in enumerate(uris))
+            return f"{answer}\n\n{uri_lines}"
+        return answer
     except ValueError as exc:
         return _err(str(exc))
     except Exception as exc:
+        # httpx 等异常的 str() 可能为空字符串，给出类型名兜底
+        msg = str(exc).strip() or type(exc).__name__
         log.exception("工具调用失败")
-        return _err(str(exc))
+        return _err(msg)
 
 
 class _RateLimited(RuntimeError):
@@ -364,10 +374,14 @@ async def look(image: str = "", question: str = "",
 
     Args:
         image: 单张图片来源：本地路径（png/jpg/jpeg/webp/gif/bmp）、
-            http(s) URL、或之前上传返回的 tos-cn-i-* URI。
+            http(s) URL、或之前调用返回的 attachment_uri。
         images: 多张图片来源列表（与 image 二选一，最多 9 张）。
         question: 关于图片的问题，多图时请指明如何对比/综合；留空则默认
             "请详细描述这张图片的内容"（多图时逐张描述）。
+
+    Returns:
+        豆包对图片的文字回答；末尾附 attachment_uri（tos 存储路径），
+        后续追问同一张图时直接把它作为 image 参数传入，无需重新上传。
 
     Returns:
         豆包对图片的文字回答（含 OCR、图表理解、推理等）。
@@ -392,13 +406,15 @@ async def read(file: str = "", question: str = "",
 
     Args:
         file: 单个文件来源：本地路径（最大 50MB）、http(s) URL、
-            或之前上传返回的 tos-cn-i-* URI。
+            或之前调用返回的 attachment_uri。
         files: 多个文件来源列表（与 file 二选一，最多 9 个）。
         question: 关于文件的问题，多文件时请说明要对比/汇总什么；留空则
             默认"请总结这个文件的主要内容"（多文件时逐个总结）。
 
     Returns:
-        豆包基于文件内容的文字回答（摘要、问答、翻译、数据提取等）。
+        豆包基于文件内容的文字回答（摘要、问答、翻译、数据提取等）；
+        末尾附 attachment_uri（tos 存储路径），后续追问同一文件时直接
+        引用即可，无需重新上传。
     """
     sources = _collect_sources(file, files)
     if not sources:
