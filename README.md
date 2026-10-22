@@ -55,6 +55,30 @@ mcp SDK **1.x 与 2.x 均支持**：2.x 用 `MCPServer`，1.x 自动回退到等
 `FastMCP`（现有全局装 mcp 1.x 的环境无需升级，不影响其他依赖 1.x 的工具链）。
 兼容性测试：`python tests/test_mcp_compat.py`。
 
+### Linux 服务器 / Docker
+
+Linux 下支持三类环境，`--no-sandbox` 按需自动添加（桌面环境不加，避免
+不必要的 sandbox 降级）：
+
+| 环境 | 判定 | 处理 |
+|---|---|---|
+| 桌面 Linux（有 `DISPLAY`/`WAYLAND_DISPLAY`） | 有显示服务 | 正常启动，无需配置 |
+| 无头服务器（无显示服务） | 环境变量缺失 | 自动加 `--no-sandbox` |
+| root 用户 / Docker 容器 | `geteuid()==0` 或 `/.dockerenv` 存在 | 自动加 `--no-sandbox` |
+
+```bash
+# Ubuntu/Debian 安装浏览器（任选其一）
+sudo apt install chromium-browser        # 或 google-chrome-stable / microsoft-edge-stable
+pip install -e .
+python -m doubao_eye                      # stdio 模式由 MCP 客户端拉起，无需手动运行
+```
+
+特殊场景强制覆盖：`DOUBAO_EYE_NO_SANDBOX=true`（强制加）/ `=false`（强制不加）。
+
+> 注意：Linux 上 WebGL 会报告 `Mesa/llvmpipe` 或具体 GPU 字符串——这在 Linux
+> 上是真实用户常态，不是指纹泄漏；但免登录通道在 Linux 指纹下的通过率建议
+> 部署后自行跑一轮 `look` 验证。
+
 ## 接入 MCP 客户端
 
 ### Claude Code

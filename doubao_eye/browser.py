@@ -192,6 +192,33 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _needs_no_sandbox() -> bool:
+    """判断是否需要 ``--no-sandbox``（仅 Linux/macOS 生效）。
+
+    Chromium 家族在以下环境会拒绝以默认 sandbox 启动（进程秒退）：
+    - root 用户（容器内常以 root 跑）
+    - 无 ``DISPLAY`` 且无 ``WAYLAND_DISPLAY`` 的无头服务器
+    - Docker 容器（无 user namespace 时 seccomp 配置不足）
+
+    可用环境变量 ``DOUBAO_EYE_NO_SANDBOX=true/false`` 强制覆盖。
+    桌面 Linux（有 DISPLAY）不加，避免不必要的 sandbox 降级。
+    """
+    if sys.platform == "win32":
+        return False
+    override = os.environ.get("DOUBAO_EYE_NO_SANDBOX", "").strip().lower()
+    if override in ("1", "true", "yes"):
+        return True
+    if override in ("0", "false", "no"):
+        return False
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return True
+    has_display = bool(os.environ.get("DISPLAY") or
+                       os.environ.get("WAYLAND_DISPLAY"))
+    in_container = Path("/.dockerenv").exists() or \
+        Path("/run/.containerenv").exists()
+    return not has_display or in_container
+
+
 # Chromium GREASE 品牌轮换表（与真实浏览器一致的占位品牌）
 _GREASE_BRANDS = ["Not_A Brand", "Not A(Brand", "Not?A_Brand",
                   "Not/A)Brand", "Not-A.Brand"]
@@ -625,6 +652,12 @@ class CdpBrowser:
         ]
         if self.headless:
             args.insert(1, "--headless=new")
+        # Linux 无头环境（无 DISPLAY 的服务器 / root / Docker 容器）下
+        # Chromium 家族拒绝以默认 sandbox 启动，按需放宽：
+        # 仅在检测到这些环境时添加，桌面 Linux 不加（避免不必要的降级）
+        if _needs_no_sandbox():
+            args.insert(1, "--no-sandbox")
+            args.insert(2, "--disable-dev-shm-usage")
 
         log.info("启动浏览器: %s (headless=%s, port=%d)", exe, self.headless, port)
         self._proc = subprocess.Popen(
