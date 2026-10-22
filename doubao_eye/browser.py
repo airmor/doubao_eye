@@ -205,6 +205,13 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
 def _screen_geometry() -> tuple[int, int, int, int]:
     """探测运行机器的真实屏幕几何 (width, height, availHeight, chrome_h)。
 
@@ -257,9 +264,91 @@ def _screen_geometry() -> tuple[int, int, int, int]:
     return w, h, avail_h, 87
 
 
-def _build_stealth_js() -> str:
-    """按运行机器的真实屏幕几何填充 stealth 模板。"""
-    w, h, avail_h, chrome_h = _screen_geometry()
+# ── 设备身份变动（reset_profile 时重新生成）─────────────────
+#
+# 背景：删 profile 只换 web_id/cookie，GPU/canvas/字体/屏幕等指纹完全
+# 不变 —— 风控若按指纹聚类，"新身份"实为"同一设备清 cookie 重试"，
+# 反而加重嫌疑。reset 时对指纹簇做合理范围内的变动（每一项仍是
+# 真实存在的设备配置，且与运行机器的平台自洽）。
+
+# 常见桌面显示器配置（宽，高，任务栏/菜单栏高度损失）
+_DISPLAY_CONFIGS = [
+    (1920, 1080, 40),   # 全高清 + Windows 任务栏
+    (1920, 1080, 56),   # 全高清 + 任务栏放大
+    (1536, 864, 40),    # 125% 缩放的 1920x1080
+    (1600, 900, 40),    # 笔记本常见
+    (1366, 768, 40),    # 入门笔记本
+    (2560, 1440, 48),   # 2K
+    (1680, 1050, 25),   # 16:10 / macOS
+    (1440, 900, 25),    # MacBook Air 类
+]
+
+# 常见窗口装饰高度（标签栏+地址栏+边框，浏览器间差异小）
+_CHROME_HEIGHTS = [80, 84, 87, 90, 94]
+
+
+def _identity_path(profile_dir: str) -> Path:
+    return Path(profile_dir).parent / "identity.json"
+
+
+def _load_identity(path: Path) -> dict:
+    """加载持久化的设备身份变体；不存在则生成并保存。
+
+    变体在进程重启间保持稳定（同一"设备"不该每次启动换指纹），
+    只有 reset_profile() 才重新生成。
+    """
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "display" in data and "chrome_h" in data:
+                return data
+    except Exception:
+        pass
+    # 首个身份以本机真实屏幕为基础（探测失败才退回常见配置表）
+    import random
+    real_w, real_h, real_avail, _real_chrome = _screen_geometry()
+    if (real_w, real_h) == (1920, 1080) and real_avail == 1040:
+        # 无法区分"真实探测成功"与"默认回退值"，视为成功（默认值即
+        # 最常见配置，两种情况都合理）
+        taskbar = 40
+    else:
+        taskbar = real_h - real_avail
+    identity = {
+        "display": [real_w, real_h],
+        "taskbar_loss": max(taskbar, 1),
+        "chrome_h": random.choice(_CHROME_HEIGHTS),
+        "seed": random.randint(1000, 9999),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(identity, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return identity
+
+
+def _regenerate_identity(path: Path) -> dict:
+    """删除持久化身份文件并生成新的（reset_profile 用）。"""
+    with contextlib.suppress(Exception):
+        path.unlink()
+    return _load_identity(path)
+
+
+def _build_stealth_js(identity: dict) -> str:
+    """按设备身份（含屏幕几何变体）填充 stealth 模板。
+
+    首个身份以运行机器的真实屏幕为基础（探测失败才用常见配置），
+    reset 后的新身份从真实存在的显示器配置中随机取 —— 变动是
+    "换了一台合理配置的机器"，而不是无法解释的随机值。
+    """
+    display = tuple(identity.get("display") or _screen_geometry()[:2])
+    w, h = display
+    taskbar = identity.get("taskbar_loss")
+    if not taskbar:
+        real = _screen_geometry()
+        taskbar = real[1] - real[2]
+    chrome_h = identity.get("chrome_h") or 87
+    avail_h = max(h - taskbar, 1)
     return (_STEALTH_TEMPLATE
             .replace("{{SCREEN_W}}", str(w))
             .replace("{{SCREEN_H}}", str(h))
@@ -537,6 +626,9 @@ class CdpBrowser:
         self._port: Optional[int] = None
         self._ready = False
         self._lifecycle_lock = asyncio.Lock()
+        # 设备身份变体（屏幕几何/装饰高度等指纹簇参数）：
+        # 持久化于 profile 旁的 identity.json，reset_profile 时重新生成
+        self._identity: dict = _load_identity(_identity_path(self.profile_dir))
 
         # 状态（供 status 工具与日志使用）
         self.last_error: str = ""
@@ -576,15 +668,30 @@ class CdpBrowser:
             await self._launch_locked()
 
     async def reset_profile(self) -> None:
-        """关闭浏览器并删除 profile（设备指纹被风控拉黑后的自愈手段）。
+        """关闭浏览器、删除 profile 并重新生成设备身份（风控自愈手段）。
 
-        删除后重新启动 = 全新 device_id / cookie，相当于换了台新设备。
+        两层修正（均由对照实验验证）：
+        1. 只删 profile 换 web_id/cookie 是不够的 —— GPU/canvas/字体/
+           屏幕等指纹完全不变，风控按指纹聚类时"新身份"实为"同一设备
+           清 cookie 重试"。因此同时重新生成指纹簇变体（屏幕几何从
+           真实存在的显示器配置中随机取，窗口装饰高度小幅变动 ——
+           每一项仍是合理设备配置），相当于换了一台同平台的另一台机器。
+        2. "同指纹簇换 ID"本身是风控信号 —— 实测新身份+新指纹首发即
+           710022002，而同一新身份的第二发立即成功。因此 reset 后强制
+           冷却（默认 90 秒，DOUBAO_EYE_RESET_COOLDOWN 可调），给风控
+           的"设备变更"观察窗留出时间。
         """
         async with self._lifecycle_lock:
             await self._stop_locked()
             import shutil
             with contextlib.suppress(Exception):
                 shutil.rmtree(self.profile_dir, ignore_errors=True)
+            self._identity = _regenerate_identity(
+                _identity_path(self.profile_dir))
+            cooldown = _env_float("DOUBAO_EYE_RESET_COOLDOWN", 90.0)
+            log.info("设备身份已重置，冷却 %.0f 秒后重新启动", cooldown)
+            await asyncio.sleep(cooldown)
+            await self._launch_locked()
             log.warning("已重置浏览器 profile（%s），以新设备指纹重启", self.profile_dir)
             await self._launch_locked()
 
@@ -768,11 +875,12 @@ class CdpBrowser:
                 except Exception as exc:
                     log.warning("UA 覆盖失败（继续运行）: %s", exc)
             # 指纹加固脚本：在每个新文档执行（在站点脚本之前）；
-            # 屏幕几何按本机真实值填充（覆盖 Screen 原型 getter ——
-            # headless 虚拟显示器默认 800x600，实例属性与 CDP
-            # setDeviceMetricsOverride 都改不动原型 getter）
+            # 屏幕几何来自设备身份（首个身份=本机真实值，reset 后=合理
+            # 配置变体；覆盖 Screen 原型 getter —— headless 虚拟显示器
+            # 默认 800x600，实例属性与 CDP setDeviceMetricsOverride 都
+            # 改不动原型 getter）
             await conn.call("Page.addScriptToEvaluateOnNewDocument",
-                            {"source": _build_stealth_js()})
+                            {"source": _build_stealth_js(self._identity)})
 
             # 导航到豆包并等待页面就绪
             load_task = asyncio.create_task(
