@@ -1,0 +1,31 @@
+# doubao_eye runtime data (browser profile / pid)
+.doubao_eye/
+profile*/
+browser.pid
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Env / secrets
+.env
+
+# IDE / Editor
+.cursor/
+.vscode/
+.idea/
+
+# Test scratch
+_test_*
+_probe_*
+*.log
+
+# OS
+Thumbs.db
+.DS_Store

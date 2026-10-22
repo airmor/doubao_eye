@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "doubao-eye"
+dynamic = ["version"]
+description = "给没有多模态能力的大模型装上眼睛 —— 豆包网页版免登录 MCP 服务（识图/读文件）"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "doubao-eye contributors" }]
+keywords = ["mcp", "doubao", "multimodal", "vision", "agent-tools", "豆包"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "mcp>=1.2",
+    "httpx>=0.27",
+    "websockets>=12",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourname/doubao_eye"
+
+[project.scripts]
+doubao-eye = "doubao_eye.__main__:main"
+
+[tool.hatch.version]
+path = "doubao_eye/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["doubao_eye"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
