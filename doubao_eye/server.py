@@ -259,11 +259,16 @@ async def _materialize(kind: str, source: str, default_name: str) -> dict:
 
 
 async def _run(question: str, items: list[tuple[str, str]],
-               default_question: str) -> str:
+               default_question: str, kind_hint: str = "") -> str:
     """通用流程：解析多个输入 → 逐个上传 → 一次对话带全部附件。
 
     附件上传不受匿名通道限流约束，稀缺的只有 chat/completion 一次调用，
     因此多附件合并进一次对话能把等待时间从 N 倍间隔塌缩为一次间隔。
+
+    "盲人"前缀 + 精简指令（A/B/C 实测验证）：把回答定位从"给看得到图的人
+    做解说"换成"给看不到图的人传递信息"，并显式禁掉解释/总结/追问 ——
+    豆包快速模式的 OCR 完整度不变（7/7 行小字一字不差），但输出从
+    ~200 token 的"内容+释义+推销"塌缩为 ~70 token 的纯内容。
     """
     if not items:
         return _err("缺少附件参数")
@@ -271,6 +276,8 @@ async def _run(question: str, items: list[tuple[str, str]],
     if len(items) > MAX_ATTACHMENTS:
         return _err(f"单次调用最多 {MAX_ATTACHMENTS} 个附件（收到 {len(items)} 个），"
                     "请分批调用")
+    if kind_hint:
+        question = f"我是盲人。{kind_hint}{question}请只陈述图中内容本身，不要解释含义、不要总结、不要反问我。"
 
     try:
         images: list[dict] = []
@@ -371,7 +378,8 @@ async def look(image: str = "", question: str = "",
     if len(sources) > 1 and not (question or "").strip():
         question = "请逐张详细描述这些图片的内容。"
     return await _run(question, [("image", s) for s in sources],
-                      "请详细描述这张图片的内容。")
+                      "请详细描述这张图片的内容。",
+                      kind_hint="我看不见图片，")
 
 
 @server.tool()
@@ -398,7 +406,8 @@ async def read(file: str = "", question: str = "",
     if len(sources) > 1 and not (question or "").strip():
         question = "请逐个总结这些文件的主要内容。"
     return await _run(question, [("file", s) for s in sources],
-                      "请总结这个文件的主要内容。")
+                      "请总结这个文件的主要内容。",
+                      kind_hint="我看不到这个文件的内容，")
 
 
 @server.tool()
@@ -431,7 +440,8 @@ async def watch(video: str, question: str = "") -> str:
         )
     # tos URI 或未知扩展：仍尝试发送（万一豆包后端支持）
     return await _run(question, [("file", video)],
-                      "请描述这个视频的内容。")
+                      "请描述这个视频的内容。",
+                      kind_hint="我看不到视频画面，")
 
 
 @server.tool()
