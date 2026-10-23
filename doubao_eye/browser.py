@@ -670,16 +670,18 @@ class CdpBrowser:
     async def reset_profile(self) -> None:
         """关闭浏览器、删除 profile 并重新生成设备身份（风控自愈手段）。
 
-        两层修正（均由对照实验验证）：
-        1. 只删 profile 换 web_id/cookie 是不够的 —— GPU/canvas/字体/
-           屏幕等指纹完全不变，风控按指纹聚类时"新身份"实为"同一设备
-           清 cookie 重试"。因此同时重新生成指纹簇变体（屏幕几何从
-           真实存在的显示器配置中随机取，窗口装饰高度小幅变动 ——
-           每一项仍是合理设备配置），相当于换了一台同平台的另一台机器。
-        2. "同指纹簇换 ID"本身是风控信号 —— 实测新身份+新指纹首发即
-           710022002，而同一新身份的第二发立即成功。因此 reset 后强制
-           冷却（默认 90 秒，DOUBAO_EYE_RESET_COOLDOWN 可调），给风控
-           的"设备变更"观察窗留出时间。
+        三层设计（对照实验验证）：
+        1. 只删 profile 换 web_id/cookie 不够 —— GPU/canvas/字体/屏幕等
+           指纹不变，风控按指纹聚类时"新身份"实为"同一设备清 cookie
+           重试"。同时重新生成指纹簇变体（屏幕几何从真实存在的显示器
+           配置中随机取，窗口装饰高度小幅变动），相当于换了一台同平台
+           的另一台机器。
+        2. "同指纹簇换 ID"本身是风控信号 —— 实测新身份首发易吃 710022002，
+           同一新身份的第二发立即成功。因此 reset 后强制冷却（默认 90
+           秒，DOUBAO_EYE_RESET_COOLDOWN 可调）。
+        3. 预热：冷却结束、真实请求发出前，先发一条内部探测消息把"换 ID
+           后第一发"的软拒绝吃掉，让 agent 的第一发就是真请求（预热失败
+           不阻塞 —— 最坏情况回退为旧行为：首发可能撞一次限流）。
         """
         async with self._lifecycle_lock:
             await self._stop_locked()
@@ -692,8 +694,34 @@ class CdpBrowser:
             log.info("设备身份已重置，冷却 %.0f 秒后重新启动", cooldown)
             await asyncio.sleep(cooldown)
             await self._launch_locked()
-            log.warning("已重置浏览器 profile（%s），以新设备指纹重启", self.profile_dir)
-            await self._launch_locked()
+            log.warning("已重置浏览器 profile（%s），以新设备指纹重启",
+                        self.profile_dir)
+        # 预热在锁外执行（拿不到 ready 状态时锁内死等会卡其他调用方）
+        await self._warmup()
+
+    async def _warmup(self) -> None:
+        """换身份后的预热：主动吃掉"新身份第一发"的软拒绝。
+
+        实测模式：reset 后首发大概率 710022002（换 ID 观察窗），第二发
+        即恢复。预热把这次必然的失败转移到内部消息上，agent 的第一发
+        直接是可用状态。预热最多尝试 2 次、共约 8 秒，失败不影响服务
+        （只是回退为"首条可能撞限流"的旧行为）。
+        """
+        try:
+            await self.ensure_ready()
+        except Exception:
+            return
+        from .doubao import DoubaoSession
+        session = DoubaoSession(self, chat_timeout=20.0)
+        for i in range(2):
+            try:
+                await session.chat("你好")
+                log.info("新身份预热成功（第 %d 次）", i + 1)
+                return
+            except Exception as exc:
+                log.info("新身份预热第 %d 次被拒（预期内）: %s",
+                         i + 1, str(exc)[:80])
+                await asyncio.sleep(4)
 
     async def stop(self) -> None:
         async with self._lifecycle_lock:
@@ -786,6 +814,88 @@ class CdpBrowser:
         except Exception:
             pass
 
+    def _find_orphan_pids(self) -> list[int]:
+        """深扫占用本 profile 的孤儿浏览器进程（真实根因的自愈入口）。
+
+        场景：宿主（MCP 客户端/DSH）重启 → 本服务新进程丢失对旧 Edge 的
+        CDP 连接与 pidfile 归属（pidfile 只记录我们 spawn 的那个 PID），
+        但旧 Edge 仍持有 profile 锁活着。下次启动时新 Edge 因同 profile
+        单例机制让位退出（"立即退出"），pidfile 指向的 PID 已死 →
+        _kill_stale_by_pidfile 找不到真凶 → 死锁。
+
+        解法：按命令行 ``--user-data-dir=<本 profile>`` 全系统扫描，逐一
+        校验命令行确实指向本 profile（绝不误杀用户其他浏览器）。
+        """
+        profile = str(Path(self.profile_dir).resolve()).lower()
+        orphans: list[int] = []
+        if sys.platform == "win32":
+            try:
+                raw = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-CimInstance Win32_Process -Filter "
+                     "\"Name='msedge.exe' OR Name='chrome.exe' OR "
+                     "Name='chromium.exe'\" | "
+                     "Select-Object ProcessId, CommandLine | "
+                     "ConvertTo-Json -Compress"],
+                    capture_output=True, timeout=30,
+                ).stdout
+                out = raw.decode("utf-8", errors="replace").strip()
+                if not out:
+                    return []
+                import json as _json
+                data = _json.loads(out)
+                if isinstance(data, dict):
+                    data = [data]
+                for item in data if isinstance(data, list) else []:
+                    try:
+                        pid = int(item.get("ProcessId", 0))
+                        cmd = str(item.get("CommandLine") or "").lower()
+                    except Exception:
+                        continue
+                    if pid <= 0 or pid == (self._proc.pid if self._proc else -1):
+                        continue
+                    if f"--user-data-dir={profile}" in cmd.replace('"', "") \
+                            or f"--user-data-dir {profile}" in cmd.replace('"', ""):
+                        orphans.append(pid)
+            except Exception as exc:
+                log.warning("孤儿进程扫描失败: %s", exc)
+        else:
+            # POSIX：遍历 /proc/*/cmdline
+            try:
+                for entry in Path("/proc").iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        cmdline = (entry / "cmdline").read_bytes() \
+                            .decode("utf-8", errors="replace").lower()
+                    except Exception:
+                        continue
+                    if f"--user-data-dir={profile}" in cmdline:
+                        orphans.append(int(entry.name))
+            except Exception as exc:
+                log.warning("孤儿进程扫描失败: %s", exc)
+        return orphans
+
+    def _kill_orphans(self) -> int:
+        """树杀所有占用本 profile 的孤儿进程，返回清理数。"""
+        pids = self._find_orphan_pids()
+        killed = 0
+        for pid in pids:
+            log.info("清理孤儿浏览器进程 pid=%d（持有本 profile 锁）", pid)
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True, timeout=15,
+                    )
+                    killed += 1
+                else:
+                    os.kill(pid, signal.SIGKILL)
+                    killed += 1
+            except Exception as exc:
+                log.warning("清理孤儿 pid=%d 失败: %s", pid, exc)
+        return killed
+
     async def _launch_locked(self) -> None:
         self._ready = False
         exe = self.exe or find_browser()
@@ -799,17 +909,23 @@ class CdpBrowser:
         Path(self.profile_dir).mkdir(parents=True, exist_ok=True)
 
         last_exc: Optional[Exception] = None
-        for attempt in range(2):
+        for attempt in range(3):
+            log.info("浏览器启动尝试 %d/3", attempt + 1)
             self._kill_stale_by_pidfile()
             try:
                 await self._spawn_and_attach(exe)
+                log.info("浏览器启动成功（尝试 %d/3）", attempt + 1)
                 return
             except BrowserError as exc:
                 last_exc = exc
-                if "立即退出" in str(exc) and attempt == 0:
-                    log.warning("浏览器进程启动后立即退出（可能被同 profile 的"
-                                "残留实例接管），清理后重试一次")
-                    await asyncio.sleep(1)
+                if "立即退出" in str(exc):
+                    # 新 Edge 让位退出 = profile 被孤儿实例持有。pidfile
+                    # 只认我们 spawn 的 PID，此时指向已死 → 深扫命令行
+                    # 匹配本 profile 的真凶并树杀，再重试
+                    killed = self._kill_orphans()
+                    log.warning("浏览器让位退出，深扫清理了 %d 个孤儿进程，"
+                                "准备重试", killed)
+                    await asyncio.sleep(2)
                     continue
                 raise
         raise last_exc
