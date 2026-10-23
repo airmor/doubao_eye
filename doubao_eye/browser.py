@@ -79,6 +79,12 @@ try {
   over(sp, 'pixelDepth', 24);
 } catch (e) {}
 try {
+  // devicePixelRatio：真实浏览器报显示器的 DPI 缩放（如 1.75），
+  // headless 虚拟显示器恒为 1 —— 与 screen 尺寸组合出现即矛盾
+  Object.defineProperty(window, 'devicePixelRatio', {
+    get: () => {{DPR}}, configurable: true});
+} catch (e) {}
+try {
   if (navigator.connection) {
     Object.defineProperty(navigator.connection, 'effectiveType', {get: () => '4g', configurable: true});
     Object.defineProperty(navigator.connection, 'rtt', {get: () => 50, configurable: true});
@@ -213,24 +219,32 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _screen_geometry() -> tuple[int, int, int, int]:
-    """探测运行机器的真实屏幕几何 (width, height, availHeight, chrome_h)。
+    """探测运行机器的**逻辑**屏幕几何 (width, height, availHeight, chrome_h)。
 
-    - Windows：用 ctypes 查物理显示器分辨率；任务栏高度从工作区推算
-    - macOS/Linux：读主显示器分辨率（ctypes/环境不可用时退回保守默认）
+    返回的是浏览器 window.screen 看到的值（逻辑像素，含 DPI 缩放语义），
+    而非物理像素 —— 真实浏览器在有 DPI 缩放的机器上报告的是逻辑值
+    （如 3072×1920 物理 @175% → 1756×1098 逻辑），报物理值反而成假指纹。
+
+    - Windows：GetScaleFactorForDevice 取缩放，物理分辨率换算逻辑值
+    - macOS/Linux：读主显示器分辨率（不可用时退回保守默认）
     - chrome_h：浏览器窗口装饰高度（标签栏+地址栏+边框），Edge/Chrome
       常见 ~87px —— 各浏览器差异不大，取该默认值
-
-    所有值都是"这台机器的合理值"，不硬编码特定机型。
     """
     w, h, avail_h = 1920, 1080, 1040   # 保守默认（最常见桌面分辨率）
     if sys.platform == "win32":
         try:
             import ctypes
             user32 = ctypes.windll.user32
-            user32.SetProcessDPIAware()
+            # 不调用 SetProcessDPIAware：DPI-unaware 进程的 GetSystemMetrics
+            # 直接返回逻辑像素（浏览器 window.screen 看到的值）——
+            # 3072×1920 物理 @175% 下即为 1755×1097，与真实浏览器一致
             w = user32.GetSystemMetrics(0)
             h = user32.GetSystemMetrics(1)
             avail_h = user32.GetSystemMetrics(61)  # SM_CYWORKAREA
+            # DPI 虚拟化下工作区指标可能返回怪值（比屏幕还大）——
+            # 屏幕值可信，只对 avail 单独兜底（任务栏高度按逻辑 48px 计）
+            if not (0 < avail_h <= h):
+                avail_h = h - 48
         except Exception:
             pass
     elif sys.platform == "darwin":
@@ -262,6 +276,17 @@ def _screen_geometry() -> tuple[int, int, int, int]:
     if w <= 0 or h <= 0 or avail_h <= 0 or avail_h > h:
         w, h, avail_h = 1920, 1080, 1040
     return w, h, avail_h, 87
+
+
+def _display_scale() -> float:
+    """DPI 缩放系数（浏览器 devicePixelRatio 的真实值）。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            return int(ctypes.windll.shcore.GetScaleFactorForDevice(0)) / 100.0
+        except Exception:
+            return 1.0
+    return 1.0
 
 
 # ── 设备身份变动（reset_profile 时重新生成）─────────────────
@@ -317,6 +342,7 @@ def _load_identity(path: Path) -> dict:
         "display": [real_w, real_h],
         "taskbar_loss": max(taskbar, 1),
         "chrome_h": random.choice(_CHROME_HEIGHTS),
+        "dpr": _display_scale(),
         "seed": random.randint(1000, 9999),
     }
     try:
@@ -335,7 +361,7 @@ def _regenerate_identity(path: Path) -> dict:
 
 
 def _build_stealth_js(identity: dict) -> str:
-    """按设备身份（含屏幕几何变体）填充 stealth 模板。
+    """按设备身份（含屏幕几何变体与 DPR）填充 stealth 模板。
 
     首个身份以运行机器的真实屏幕为基础（探测失败才用常见配置），
     reset 后的新身份从真实存在的显示器配置中随机取 —— 变动是
@@ -349,11 +375,15 @@ def _build_stealth_js(identity: dict) -> str:
         taskbar = real[1] - real[2]
     chrome_h = identity.get("chrome_h") or 87
     avail_h = max(h - taskbar, 1)
+    dpr = identity.get("dpr") or _display_scale()
+    # DPR 与屏幕组合必须自洽：非整数 DPR 意味着 HiDPI 缩放，
+    # 此时显示器配置表里的值已是逻辑值，无需换算
     return (_STEALTH_TEMPLATE
             .replace("{{SCREEN_W}}", str(w))
             .replace("{{SCREEN_H}}", str(h))
             .replace("{{AVAIL_H}}", str(avail_h))
-            .replace("{{CHROME_H}}", str(chrome_h)))
+            .replace("{{CHROME_H}}", str(chrome_h))
+            .replace("{{DPR}}", str(dpr)))
 
 
 def _needs_no_sandbox() -> bool:
